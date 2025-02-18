@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function bootstrap::cloneBranch() {
+    local -r repository="$1"
+    local -r branch="$2"
+    local -r directory="$3"
+
+    command -v git &>/dev/null || bootstrap::installGit || return $?
+
+    printf 'Checking if git repository has an installer for your distribution\n' >&2
+    # get all branches in one call. This prevent from doing a second request if we can't find the branch
+    allBranches="$( git ls-remote --quiet --heads "$repository" | sed -E -e 's/^.*refs\/heads\///' | grep -vE '^main$' )"
+
+    if ! echo "$allBranches" | grep -q -E "^$branch\$"
+    then
+        printf $'\e''[38;5;1m' >&2
+        printf 'Your current distribution version is not supported (yet?).\n' >&2
+        printf $'\e''[39m' >&2
+        printf 'detected distribution: %s\n' "$branch" >&2
+        printf 'Supported distributions\n' >&2
+        printf '-----------------------\n' >&2
+
+        printf '%s\n' "$allBranches" | while IFS= read -r branchFound
+        do
+            printf ' * %s\n' "$branchFound" >&2
+        done
+
+        printf 'Maybe you can clone one of them?\n' >&2
+        printf '$ git clone --quiet --single-branch --depth=1 --branch "\e[4m<distribution>\e[24m" "%s" "%s"\n' "$repository" "$directory" >&2
+
+        return 1
+    fi
+
+    printf >&2 'Found! Cloning repository...\n'
+    git clone --quiet --single-branch --depth=1 --branch "$branch" "$repository" "$directory"
+}
+declare -rf bootstrap::cloneBranch
+
+function bootstrap::detectOperatingSystem() {
+    if [[ $OSTYPE != linux-gnu* ]]
+    then
+        printf 'Your operating system is not supported.\n' >&2
+
+        return 1
+    fi
+
+    # lsb_release for easiest, complete, cross-distro discovery
+    if command -v lsb_release &>/dev/null
+    then
+        lsb_dist="$( lsb_release -i -s )"
+        DIST_DISTRIBUTION="${lsb_dist,,}"  # Convert to lowercase
+        # Assuming version is numeric therefore doesn't need lowercasing
+        DIST_VERSION="$( lsb_release -r -s )"
+    # release file methods
+    elif [[ -e /etc/redhat-release ]]
+    then
+        # RedHat family distributions all have this file
+        # sed to make it conform to what `lsb_release -d` would produce if it were available
+        file_dist=$( sed 's/ release [0-9].*$//; s/ linux$//i; s/ linux //ig; s/ //g' /etc/redhat-release )
+        DIST_DISTRIBUTION="${file_dist,,}"
+        DIST_VERSION=$( sed 's/^.* release \([0-9][0-9.]*\).*$/\1/' /etc/redhat-release )
+    elif [[ -e /etc/lsb-release ]]
+    then
+        # Convert to lowercase
+        DIST_DISTRIBUTION="$( source /etc/lsb-release ; echo "${DISTRIB_ID,,}" )"
+        # Assuming version is numeric therefore doesn't need lowercasing
+        DIST_VERSION="$( source /etc/lsb-release ; echo "$DISTRIB_RELEASE" )"
+    elif [[ -e /etc/debian_version ]]
+    then
+        # Can only be Debian (Ubuntu caught by /etc/lsb-release, above)
+        DIST_DISTRIBUTION=debian
+        DIST_VERSION="$( cat /etc/debian_version )"
+    # systemd's os-release (might not have full version number)
+    elif [[ -e /etc/os-release ]]
+    then
+        DIST_DISTRIBUTION="$( source /etc/os-release ; echo "$ID" )"
+        DIST_VERSION="$( source /etc/os-release ; echo "$VERSION_ID" )"
+    elif [[ -e /usr/lib/os-release ]]
+    then
+        DIST_DISTRIBUTION="$( source /usr/lib/os-release; echo "$ID" )"
+        DIST_VERSION="$( source /usr/lib/os-release; echo "$VERSION_ID" )"
+    else
+        case "$OSTYPE" in
+            linux-gnu*)
+                printf 'Your operating system is not supported.\n' >&2
+                ;;
+            darwin*)
+                printf 'OSX is not supported.\n' >&2
+                ;;
+            cygwin|msys|win32)
+                printf 'Windows is not supported.\n' >&2
+                ;;
+            freebsd*)
+                printf 'freebsd is not supported.\n' >&2
+                ;;
+        esac
+
+        return 1
+    fi
+
+    if [[ $DIST_DISTRIBUTION = 'ubuntu' ]]
+    then
+        # Every release of Ubuntu is a major release
+        DIST_VERSION_MAJOR="$DIST_VERSION"
+    else
+        # Everything up to first '.' is major version
+        DIST_VERSION_MAJOR="${DIST_VERSION%%.*}"
+    fi
+
+    export DIST_DISTRIBUTION DIST_VERSION_MAJOR
+}
+declare -rf bootstrap::detectOperatingSystem
+
+function bootstrap::help() {
+    printf '
+\e[1mNAME\e[22m
+\t%s - clone repository and run install script on detected distribution branch
+
+\e[1mSYNOPSIS\e[22m
+\t\e[38;5;2m%s\e[39m [\e[38;5;3m--help\e[39m] [\e[38;5;3m--dir \e[4m<directory>\e[24;39m] [\e[38;5;3m--repository \e[4m<repository>\e[24;39m]
+
+\e[1mOPTIONS\e[22m
+       \e[38;5;3m--help\e[39m
+           Display this help message.
+
+       \e[38;5;3m--dir \e[4m<directory>\e[24;39m
+           Use this directory as location to clone repository. Creates a
+           temporary directory by default.
+
+       \e[38;5;3m--repository \e[4m<repository>\e[24;39m
+           The (possibly remote) \e[4;38;5;3m<repository>\e[24;39m to clone
+           from.
+
+       \e[38;5;3m--stats, --no-stats\e[39m
+           Enable or disable running stats before and after software
+           installation to see all the files that have been modified/created.
+           This option is passed to the distribution installer.
+           Default: enabled
+
+       \e[38;5;3m--default\e[39m
+           Use default settings and reduce the number of interactions required
+           to install. This option disable the creation of workspaces.
+           This option is passed to the distribution installer.
+' "${0##*/}" "${0##*/}"
+}
+declare -rf bootstrap::help
+
+function bootstrap::installGit() {
+    printf 'Installing git\n' >&2
+
+    if command -v apt-get &>/dev/null
+    then
+        sudo apt-get -qq -y --update --no-install-recommends install git ca-certificates
+    elif command -v dnf &>/dev/null
+    then
+        sudo dnf -q -y --refresh install git ca-certificates
+    elif command -v yum &>/dev/null
+    then
+        sudo yum -q -y install git ca-certificates
+    else
+        printf 'Unable to install git - could not determine the package manager of your distribution.\n' >&2
+
+        return 1
+    fi
+}
+declare -rf bootstrap::installGit
+
+function bootstrap::main() {
+    local branch
+    local directory=
+    local repository=
+    local -a installScriptOptions=()
+
+    while [[ $# -gt 0 ]]
+    do
+        case "$1" in
+            --directory|--repository) # only check for presence of a second argument here
+                if [[ $# -eq 1 ]]
+                then
+                    printf '%s: missing parameter for option %s\n' "${0##*/}" "$1" >&2
+                    bootstrap::usage >&2
+                    return 2
+                fi
+                ;;&
+            -h|--help|-\?) bootstrap::help >&2; return 0;;
+            --stats|--no-stats|--default) installScriptOptions+=("$1"); shift;;
+            --directory)
+                directory="$2"
+                shift 2
+                ;;
+            --repository)
+                repository="$2"
+                shift 2
+                ;;
+            -*) printf '%s: unknown option %s\n' "${0##*/}" "$1" >&2; bootstrap::usage >&2; return 2;;
+            *)  printf '%s: unknown argument %s\n' "${0##*/}" "$1" >&2; bootstrap::usage >&2; return 2;;
+        esac
+    done
+
+    [[ -n "$directory" ]] || directory="$( mktemp -d )"
+    [[ -n "$repository" ]] || repository='https://github.com/juliendufresne/system-post-install.git'
+
+    bootstrap::detectOperatingSystem || return 1
+    branch="$DIST_DISTRIBUTION-$DIST_VERSION_MAJOR"
+
+    bootstrap::cloneBranch "$repository" "$branch" "$directory"
+
+    [[ $( pwd ) == "$directory" ]] || cd "$directory" || return 1
+
+    [[ $( git branch --show-current ) == "$branch" ]] || git checkout "$branch"
+
+    if [[ ! -x install ]]
+    then
+        if [[ -f install ]]
+        then
+            printf "File '%s/install' is not executable.\n" "$directory" >&2
+        else
+            printf "File '%s/install' does not exist.\n" "$directory" >&2
+        fi
+
+        return 1
+    fi
+
+    printf 'Running install.\n' >&2
+    ./install "${installScriptOptions[@]}"
+}
+declare -rf bootstrap::main
+
+function bootstrap::usage() {
+    printf 'usage: \e[38;5;2m%s\e[39m' "${0##*/}"
+    printf ' [\e[38;5;3m--help\e[39m]'
+    printf ' [\e[38;5;3m--dir \e[4m<directory>\e[24;39m]'
+    printf ' [\e[38;5;3m--repository \e[4m<repository>\e[24;39m]\n'
+    printf ' [\e[38;5;3m--(no-)stats\e[39m]'
+    printf ' [\e[38;5;3m--default\e[39m]'
+}
+declare -rf bootstrap::usage
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+bootstrap::main "$@"
