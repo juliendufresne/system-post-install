@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/software-simple-install.lib.sh"
+
+declare -i exitCode=0
+
+installSimplePackage openssh-client keychain openssh-client || exitCode=$?
+
+if [[ $exitCode -eq 0 ]]
+then
+    printf '\n' >&2
+    output::info 'You can add SSH keys by running:' "\$ $PROJECT_ROOT/tools/add-ssh-key" >&2
+fi
+
+exit $exitCode

@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function slack::downloadDebFile() {
+    local -r debFile="$1"
+
+    local    downloadLink
+    local -i exitCode=0
+    local    fileExisted=false
+    local    output
+
+    output::listItemPending 'downloading package' "$LIST_ITEM_INDENT"
+
+    downloadLink="$(
+        download::get 'https://slack.com/downloads/instructions/linux?ddl=0&build=deb' \
+            | grep -o 'https://downloads.slack-edge.com/desktop-releases/linux/x64/[^[:blank:]]*.deb' \
+            | head -n 1 \
+            || true
+    )"
+
+    if [[ -z "$downloadLink" ]]
+    then
+        output::cleanPreviousLines 1
+        output::listItemError 'could not find a download link from official website' "$LIST_ITEM_INDENT"
+        log::addMessage 'could not find a download link'
+
+        return 1
+    fi
+    log::addMessage "found download link '$downloadLink'"
+
+    if [[ -f "$debFile" ]]
+    then
+        fileExisted=true
+    fi
+
+    scrollingRegion::create --full-window --header-min-height 1 5
+
+    output="$( mktemp )"
+    download::get "$downloadLink" "$debFile" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'unable to download deb package from official website' "$LIST_ITEM_INDENT"
+        log::addMessage "unable to download deb package from official website (exit code: $exitCode)"
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+        if [[ -f "$debFile" ]] && ! $fileExisted
+        then
+            rm "$debFile"
+        fi
+    else
+        output::listItemSuccess 'package downloaded' "$LIST_ITEM_INDENT"
+        log::addMessage 'deb file download completed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf slack::downloadDebFile
+
+function slack::installPackage() {
+    local -r debFile="$1"
+
+    local    output
+    local -i exitCode
+
+    output::listItemPending 'installing package' "$LIST_ITEM_INDENT"
+    log::addMessage 'installing deb package'
+
+    scrollingRegion::create --full-window --header-min-height 1 5
+
+    exitCode=0
+    output="$( mktemp )"
+
+    packageManager::install \
+        'install package' "$debFile" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install package' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install package'
+
+        output::showErrorOutputFromFile "$output" >&2
+    else
+        output::listItemSuccess 'package installed' "$LIST_ITEM_INDENT"
+        log::addMessage 'package installed'
+    fi
+
+    log::addMessage 'removing deb file'
+    rm "$debFile" "$output"
+    log::addMessage 'deb file removed'
+
+    return $exitCode
+}
+declare -rf slack::installPackage
+
+function slack::installPrerequisites() {
+    local    output
+    local -i exitCode=0
+
+    output::listItemPending 'installing software requirements' "$LIST_ITEM_INDENT"
+    log::addMessage 'installing software requirements'
+
+    output="$( mktemp )"
+    scrollingRegion::create --full-window --header-min-height 1 5
+    packageManager::install 'install software requirements' libasound2t64 |& tee "$output" || exitCode=$?
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install software requirements' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install software requirements'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'software requirements installed' "$LIST_ITEM_INDENT"
+        log::addMessage 'software requirements installed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf slack::installPrerequisites
+
+function slack::main() {
+    local -r debFile=./slack.deb
+
+    log::addMessage 'install slack'
+
+    softwareParseOpt "$@" || return $?
+    slack::installPrerequisites || return $?
+    slack::downloadDebFile "$debFile" || return $?
+    slack::installPackage "$debFile" || return $?
+}
+declare -rf slack::main
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/download.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+source "$PROJECT_ROOT/lib/software-parse-opt.lib.sh"
+
+slack::main "$@"

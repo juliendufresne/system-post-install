@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function fish::changeDefaultShell() {
+    local -r bashOptions="$-"
+    local    defaultShellPreference
+    local    setDefaultShell=false
+
+    output::listItemPending "configuring default shell" "$LIST_ITEM_INDENT"
+    log::addMessage "configuring default shell (current '$SHELL')"
+
+    if [[ $SHELL == "$( command -v fish )" ]]
+    then
+        output::cleanPreviousLines 1
+        output::listItemSuccess 'fish is already the default shell' "$LIST_ITEM_INDENT"
+        log::addMessage 'fish is already the default shell'
+
+        return 0
+    fi
+
+    defaultShellPreference="$( config::shell::getDefault )"
+    if [[ $defaultShellPreference == 'fish' ]]
+    then
+        setDefaultShell=true
+        log::addMessage 'configured (config.sh) default shell is fish'
+    else
+        log::addMessage 'configured (config.sh) default shell is not fish'
+    fi
+
+    if $USE_DEFAULT
+    then
+        if ! $setDefaultShell
+        then
+            output::cleanPreviousLines 1
+            output::listItemWarning 'fish is not used as default shell (config.sh)' "$LIST_ITEM_INDENT"
+            log::addMessage 'user choose to not use fish as default shell'
+
+            return 0
+        else
+            log::addMessage 'setting up fish as default shell by configuration'
+        fi
+    else
+        if ! dialog::hasDialogRequirements
+        then
+            dialog::installDialogBox || return $?
+        fi
+
+        set +x
+        if ! dialog::confirm 'Fish shell configuration' 'Do you want to make fish your default shell?' true
+        then
+            set "-$bashOptions"
+            config::shell::saveDefault 'false'
+            output::cleanPreviousLines 1
+            output::listItemWarning 'fish is not used as default shell' "$LIST_ITEM_INDENT"
+            log::addMessage 'user choose to not use fish as default shell'
+
+            return 0
+        else
+            set "-$bashOptions"
+            config::shell::saveDefault 'true'
+            log::addMessage 'user choose to use fish as default shell'
+        fi
+    fi
+
+    {
+        # allows to change shell without prompt for non system users
+        printf 'auth sufficient pam_usertype.so isregular\n';
+        cat /etc/pam.d/chsh;
+    } | sudo::run 'change your default shell to fish' tee /etc/pam.d/chsh >/dev/null
+
+    chsh -s "$( command -v fish )"
+    log::addMessage "default shell set to '$( command -v fish )'"
+    output::cleanPreviousLines 1
+    output::listItemSuccess 'fish is now your default shell' "$LIST_ITEM_INDENT"
+}
+declare -rf fish::changeDefaultShell
+
+function fish::installPackage() {
+    local    output
+    local -i exitCode
+
+    output::listItemPending 'installing package' "$LIST_ITEM_INDENT"
+    log::addMessage 'installing package'
+    scrollingRegion::create --full-window 5
+
+    output="$( mktemp )"
+    exitCode=0
+
+    packageManager::installRepository \
+        --key-id 88421E703EDC7AF54967DED473C9FCC9E2BB48DA \
+        fish \
+        https://ppa.launchpadcontent.net/fish-shell/release-3/ubuntu \
+        |& tee "$output" && \
+    packageManager::install \
+        'install fish' fish |& tee -a "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install fish package' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install fish package'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'package installed' "$LIST_ITEM_INDENT"
+        log::addMessage 'fish package installed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf fish::installPackage
+
+function fish::main() {
+    log::addMessage 'install fish'
+
+    softwareParseOpt "$@" || return $?
+    fish::installPackage || return $?
+    fish::changeDefaultShell || return $?
+}
+declare -rf fish::main
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/config.lib.sh"
+source "$PROJECT_ROOT/lib/dialog.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+source "$PROJECT_ROOT/lib/software-parse-opt.lib.sh"
+source "$PROJECT_ROOT/lib/sudo.lib.sh"
+
+fish::main "$@"

@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function jetbrainsToolbox::download() {
+    local -r destFile="$1"
+
+    local -i exitCode=0
+    local    downloadLink version
+    local    workingDir output
+
+    output::listItemPending 'downloading JetBrains ToolBox binary' "$LIST_ITEM_INDENT"
+    log::addMessage 'downloading JetBrains ToolBox binary'
+
+    scrollingRegion::create --full-window --header-min-height 1 5
+
+    if [[ -f $destFile ]]
+    then
+        rm "$destFile"
+        log::addMessage "removed previously installed binary file '$destFile'"
+    fi
+
+    downloadLink="$(
+        download::get "https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release&build=&_=$( date +%s%N | cut -b1-13 )" \
+            | grep -o 'https://download.jetbrains.com/toolbox/jetbrains-toolbox-[0-9][0-9\.]*[0-9].tar.gz' \
+            | head -n 1 \
+            || true
+    )"
+
+    if [[ -z "$downloadLink" ]]
+    then
+        log::addMessage 'could not find a download link'
+        exitCode=1
+    else
+        version="$( printf '%s' "$downloadLink" | grep -o '[0-9][0-9\.]*[0-9]' )"
+        log::addMessage "found version '$version' and download link '$downloadLink'."
+
+        workingDir="$( mktemp -d )"
+        output="$( mktemp )"
+
+        download::get "$downloadLink" "$workingDir"/jetbrains-toolbox.tar.gz |& tee -a "$output" && \
+        tar -C "$workingDir" -xzf "$workingDir"/jetbrains-toolbox.tar.gz |& tee -a "$output" && \
+        mv "$workingDir"/jetbrains-toolbox-"$version"/jetbrains-toolbox "$destFile" |& tee -a "$output" && \
+        rm -r "$workingDir" || exitCode=$?
+    fi
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'unable to get binary from JetBrains website' "$LIST_ITEM_INDENT"
+        log::addMessage 'unable to get binary from JetBrains website'
+
+        if [[ -v output && -f $output ]]
+        then
+            output::showErrorOutputFromFile "$output" >&2
+            log::addFile "$output"
+        fi
+        if [[ -f $destFile ]]
+        then
+            rm "$destFile"
+        fi
+    else
+        output::listItemSuccess 'binary downloaded from JetBrains website' "$LIST_ITEM_INDENT"
+        log::addMessage 'binary downloaded from JetBrains website'
+    fi
+
+    [[ ! -v workingDir || ! -d "$workingDir" ]] || rm -r "$workingDir"
+    [[ ! -v output || ! -f "$output" ]] || rm "$output"
+
+    return $exitCode
+}
+declare -rf jetbrainsToolbox::download
+
+function jetbrainsToolbox::installPrerequisites() {
+    local -i exitCode=0
+    local    output
+
+    output::listItemPending 'installing package requirements' "$LIST_ITEM_INDENT"
+    log::addMessage 'installing package requirements'
+
+    output="$( mktemp )"
+    scrollingRegion::create --full-window --header-min-height 1 5
+    packageManager::install 'install package requirements' \
+        dbus-user-session \
+        libfontconfig \
+        libfuse2 \
+        libgtk-3-bin \
+        libxi6 \
+        libxrender1 \
+        libxtst6 \
+        mesa-utils \
+        tar \
+        |& tee "$output" || exitCode=$?
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install package requirements' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install package requirements'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'package requirements installed' "$LIST_ITEM_INDENT"
+        log::addMessage 'package requirements installed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf jetbrainsToolbox::installPrerequisites
+
+function jetbrainsToolbox::main() {
+    local destFile
+
+    if [[ -f $JETBRAINS_TOOLBOX_BIN ]]
+    then
+        log::addMessage "binary found in '$JETBRAINS_TOOLBOX_BIN'."
+        output::success 'JetBrains ToolBox is already installed.'
+
+        return 0
+    fi
+
+    destFile="$( dirname "$( mktemp -u )" )/jetbrains-toolbox"
+
+    softwareParseOpt "$@" || return $?
+    jetbrainsToolbox::installPrerequisites || return $?
+    jetbrainsToolbox::updateSysctlConf || return $?
+    jetbrainsToolbox::download "$destFile" || return $?
+    jetbrainsToolbox::run "$destFile" || return $?
+}
+declare -rf jetbrainsToolbox::main
+
+function jetbrainsToolbox::run() {
+    local -r binFile="$1"
+    local -i waitTime=0 waitTimeLimit=60
+
+    output::listItemPending 'Running JetBrains ToolBox' "$LIST_ITEM_INDENT"
+    log::addMessage 'start jetbrains-toolbox.'
+
+    scrollingRegion::create --full-window --header-min-height 1 5
+
+    nohup "$binFile" &>/dev/null &
+
+    log::addMessage 'waiting for jetbrains-toolbox to finalize installation.'
+    while [[ ! -f $JETBRAINS_TOOLBOX_BIN && $waitTime -lt $waitTimeLimit ]]
+    do
+        ((++waitTime))
+        sleep 1
+
+        if [[ $waitTime -eq 2 ]]
+        then
+            output::warning 'Waiting on JetBrains ToolBox to complete the installation'
+        elif [[ $waitTime -gt 2 ]]
+        then
+            printf '.'
+        fi
+    done
+    log::addMessage "waited ${waitTime}s."
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    output::listItemSuccess 'JetBrains ToolBox has completed its installation.' "$LIST_ITEM_INDENT"
+    if [[ $waitTime -lt $waitTimeLimit ]]
+    then
+        rm "$binFile"
+        log::addMessage "removed temporary binary file '$binFile'"
+    else
+        log::addMessage "temporary binary file '$binFile' was not removed"
+        output::warning "The temporary binary file '$binFile' was not removed."
+    fi
+}
+declare -rf jetbrainsToolbox::run
+
+function jetbrainsToolbox::updateSysctlConf() {
+    local    destFile=/etc/sysctl.d/20-jetbrains.conf
+    local -i exitCode=0
+    local -i maxUserWatches=524288
+    local    output
+    local    tmpFile
+
+    output::listItemPending 'allowing more files to be watched' "$LIST_ITEM_INDENT"
+    log::addMessage 'allowing more files to be watched'
+
+    scrollingRegion::create --full-window --header-min-height 1 5
+
+    tmpFile="$( mktemp )"
+    output="$( mktemp )"
+
+    if [[ -f $destFile ]]
+    then
+        log::addMessage 'found previous sysctl config file.'
+        sed '/fs.inotify.max_user_watches/d' "$destFile" > "$tmpFile"
+    fi
+
+    printf 'fs.inotify.max_user_watches = %d\n' "$maxUserWatches" >>"$tmpFile" && \
+    sudo::run 'install JetBrains config' \
+        install -g root -o root -m 644 "$tmpFile" "$destFile" |& tee "$output" && \
+    sudo::run 'reload service procps' \
+        service procps force-reload |& tee -a "$output" && \
+    rm "$tmpFile" |& tee -a "$output" || exitCode=$?
+
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to allow more files to be watched' "$LIST_ITEM_INDENT"
+        log::addMessage "failed to allow more files to be watched (exit code: '$exitCode')"
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess "$maxUserWatches files can now be watched simultaneously" "$LIST_ITEM_INDENT"
+        log::addMessage "$maxUserWatches files can now be watched simultaneously"
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf jetbrainsToolbox::updateSysctlConf
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare JETBRAINS_TOOLBOX_BIN=~/.local/share/JetBrains/Toolbox/bin/jetbrains-toolbox
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/download.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+source "$PROJECT_ROOT/lib/software-parse-opt.lib.sh"
+source "$PROJECT_ROOT/lib/sudo.lib.sh"
+
+jetbrainsToolbox::main "$@"

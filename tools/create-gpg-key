@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function gpg::addToGit() {
+    local -r workspace="$1"
+    local -r publicKeyId="$2"
+
+    local -a gitOptions=()
+
+    if [[ -z "$workspace" ]]
+    then
+        gitOptions+=('--global')
+    else
+        gitOptions+=('-f' "$workspace/.gitconfig")
+        if ! gitConfig::get --global --type path includeIf.gitdir:"${workspace//$HOME/\~}"/.path &>/dev/null
+        then
+            gitConfig::set --global --type path includeIf.gitdir:"${workspace//$HOME/\~}"/.path "$workspace/.gitconfig"
+        fi
+    fi
+
+    gitConfig::set "${gitOptions[@]}" user.signingKey "$publicKeyId"
+}
+declare -rf gpg::addToGit
+
+function gpg::generateKey() {
+    local -n _key="$1"
+
+    local    username comment email passphrase
+    local -r bashOptions="$-"
+    local    batchFile output
+    local -a batchOptions=()
+    local -i exitCode=0
+
+    _key=""
+
+    log::addMessage 'asking for email'
+    set +x
+    if ! email="$( dialog::ask 'GPG key generation' 'Email address for GPG key' )" || [[ -z "$email" ]]
+    then
+        set "-$bashOptions"
+        output::warning 'GPG key generation canceled'
+        log::addMessage 'canceled'
+
+        return 0
+    fi
+    set "-$bashOptions"
+    log::addMessage "using email '$email'"
+
+    log::addMessage 'searching for a key with that email'
+    if gpg -q --list-secret-keys --keyid-format=long --with-colons | grep -q -E "<$email>"
+    then
+        log::addMessage 'found one, not generating a new one'
+        output::listItemSuccess "GPG key already exist for email '$email'"
+    else
+        log::addMessage "no key with email '$email'; generating a new one"
+        log::addMessage 'asking for username'
+        set +x
+        if ! username="$( dialog::ask 'GPG key generation' 'Real name used for GPG key' )" || [[ -z "$username" ]]
+        then
+            set "-$bashOptions"
+            output::warning 'GPG key generation canceled'
+            log::addMessage 'canceled'
+
+            return 0
+        fi
+        # comment and passphrase can be empty
+        log::addMessage 'asking for comment and passphrase.'
+        if ! comment="$( dialog::ask 'GPG key generation' 'GPG key comment' )" \
+        || ! passphrase="$( dialog::askPass 'GPG key generation' 'GPG key passphrase' )"
+        then
+            set "-$bashOptions"
+            output::warning 'GPG key generation canceled'
+            log::addMessage 'canceled'
+
+            return 0
+        fi
+
+        set "-$bashOptions"
+        log::addMessage 'generating file'
+        batchFile="$( mktemp )"
+
+        batchOptions+=('--verbose')
+        batchOptions+=('--batch')
+        batchOptions+=('--pinentry-mode' 'loopback')
+        batchOptions+=('--no-tty')
+        batchOptions+=('--with-colons')
+        batchOptions+=('--generate-key')
+
+        [[ -n "$passphrase" ]] || batchOptions+=('--passphrase' '')
+
+        {
+            printf 'Key-Type: eddsa\n'
+            printf 'Key-Curve: Ed25519\n'
+            printf 'Key-Usage: sign\n'
+            printf 'Subkey-Type: ecdh\n'
+            printf 'Subkey-Curve: Curve25519\n'
+            printf 'Subkey-Usage: encrypt\n'
+            [[ -z $passphrase ]] || printf 'Passphrase: %s\n' "$passphrase"
+            printf 'Name-Real: %s\n' "$username"
+            [[ -z $comment ]] || printf 'Name-Comment: %s\n' "$comment"
+            printf 'Name-Email: %s\n' "$email"
+            printf 'Expire-Date: 0\n'
+        } >"$batchFile"
+        output="$( mktemp )"
+        gpg "${batchOptions[@]}" "$batchFile" &>"$output" || exitCode=$?
+
+        rm "$batchFile"
+        if [[ "$exitCode" -ne 0 ]]
+        then
+            output::error 'Unable to create gpg key'
+            output::showErrorOutputFromFile "$output" >&2
+            log::addFile "$output"
+        else
+            log::addMessage 'GPG key generated'
+        fi
+        rm "$output"
+    fi
+
+    if [[ $exitCode -eq 0 ]]
+    then
+        log::addMessage 'searching GPG key id by email'
+        _key="$( gpg -q --list-secret-keys --keyid-format=long --with-colons | grep -E '^(sec|uid)' | grep -B 1 "<$email>"| head -n 1 | awk -F: '{ print $5 }' )"
+        log::addMessage "GPG key id '$_key' found"
+    fi
+
+    return $exitCode
+}
+declare -rf gpg::generateKey
+
+function gpg::main() {
+    local addToGit=false
+    local keyId
+    local workspace
+
+    log::addMessage "${0##*/} $*"
+
+    if ! command -v gpg &>/dev/null
+    then
+        output::error 'gpg is not installed' >&2
+        log::addMessage 'missing gpg command'
+
+        return 1
+    fi
+
+    while [[ $# -gt 0 ]]
+    do
+        case "$1" in
+            --git)
+                if ! command -v git &>/dev/null
+                then
+                    output::error "git is not installed. Required for $1 option" >&2
+
+                    return 1
+                fi
+                addToGit=true
+                shift
+                ;;
+            --git-workspace)
+                addToGit=true
+                if [[ $# -eq 1 ]]
+                then
+                    log::addMessage "missing parameter for '$1'"
+                    output::error "${0##*/}: missing parameter for '$1'" >&2
+                    gpg::usage >&2
+
+                    return 2
+                fi
+                if ! command -v git &>/dev/null
+                then
+                    output::error "git is not installed. Required for $1 option" >&2
+
+                    return 1
+                fi
+                workspace="$2"
+                if [[ ! -d "$2" ]]
+                then
+                    log::addMessage "option '$1': '$2' directory does not exist"
+                    output::error "${0##*/}: option '$1' must be a valid directory, '$2' does not exist" >&2
+                    gpg::usage >&2
+
+                    return 2
+                fi
+                shift 2
+                ;;
+            -*)
+                log::addMessage "unknown option '$1'"
+                output::error "${0##*/}: unknown option '$1'" >&2
+                gpg::usage >&2
+
+                return 2
+                ;;
+            *)
+                log::addMessage "unknown argument '$1'"
+                output::error "${0##*/}: unknown argument '$1'" >&2
+                gpg::usage >&2
+
+                return 2
+                ;;
+        esac
+    done
+
+    if ! dialog::hasDialogRequirements
+    then
+        dialog::installDialogBox || return $?
+    fi
+
+    gpg::generateKey keyId || return $?
+
+    [[ -n "$keyId" ]] || return 0
+
+    if $addToGit
+    then
+        gpg::addToGit "${workspace:-}" "$keyId" || return $?
+    fi
+
+    gpg::showKey "$keyId"
+
+    return 0
+}
+declare -rf gpg::main
+
+function gpg::showKey() {
+    local -r keyId="$1"
+
+    log::addMessage 'show GPG public key'
+
+    output::info 'Here is your public key. Put it where needed.'
+    gpg --armor --export "$keyId"
+
+    output::listing \
+        "Open $( output::link 'https://bitbucket.org/account/settings/gpg-keys' 'Bitbucket' ) settings" \
+        "Open $( output::link 'https://github.com/settings/keys' 'GitHub' ) settings" \
+        "Open $( output::link 'https://gitlab.com/-/user_settings/gpg_keys' 'GitLab' ) settings"
+
+    output::pressKeyToContinue
+
+    return 0
+}
+declare -rf gpg::showKey
+
+function gpg::usage() {
+    printf 'usage: '
+    output::color::green "$( printf '%s' "${0##*/}")"
+    printf ' ['
+    output::color::yellow '--git'
+    printf '] ['
+    output::color::yellow "--git-workspace $( output::underline '<workspace>' )"
+    printf ']\n'
+}
+declare -rf gpg::usage
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare -g PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/config.lib.sh"
+source "$PROJECT_ROOT/lib/dialog.lib.sh"
+source "$PROJECT_ROOT/lib/git-config.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+
+gpg::main "$@"

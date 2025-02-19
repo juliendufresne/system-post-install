@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# check latest: https://github.com/keeweb/keeweb/releases
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function keeweb::download() {
+    local -r toFile="$1"
+    local -r version="$2"
+
+    local -r url="https://github.com/keeweb/keeweb/releases/download/v$version/KeeWeb-$version.linux.AppImage"
+    local -i exitCode=0
+    local    output
+
+    output="$( mktemp )"
+
+    output::listItemPending 'downloading AppImage file' "$LIST_ITEM_INDENT"
+    log::addMessage "downloading AppImage file (version = '$version'; url = '$url')"
+
+    scrollingRegion::create --full-window 5
+
+    exitCode=0
+
+    download::get "$url" "$toFile" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to download AppImage file' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to download AppImage file'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'AppImage file downloaded' "$LIST_ITEM_INDENT"
+        log::addMessage 'AppImage file downloaded'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf keeweb::download
+
+function keeweb::install() {
+    local -r downloadedFile="$1"
+
+    local -i exitCode=0
+    local    output
+
+    output::listItemPending 'Installing AppImage' "$LIST_ITEM_INDENT"
+
+    if [[ ! -d ~/Applications ]]
+    then
+        mkdir ~/Applications
+    fi
+
+    chmod u+x "$downloadedFile" |& log::tee && \
+    cp "$downloadedFile" ~/Applications/KeeWeb.AppImage |& log::tee || exitCode=$?
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install AppImage' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install AppImage'
+    else
+        output::listItemSuccess 'KeeWeb.AppImage installed in ~/Applications' "$LIST_ITEM_INDENT"
+        log::addMessage 'KeeWeb.AppImage installed'
+    fi
+
+    return $exitCode
+}
+declare -rf keeweb::install
+
+function keeweb::main() {
+    local -r version='1.18.7'
+    local    appImageFile='KeeWeb.AppImage'
+
+    log::addMessage 'install KeeWeb'
+
+    softwareParseOpt "$@" || return $?
+    keeweb::download "$appImageFile" "$version" || return $?
+    keeweb::verify "$appImageFile" "$version" || return $?
+    keeweb::install "$appImageFile" || return $?
+}
+declare -rf keeweb::main
+
+function keeweb::verify() {
+    local -r checkedFile="$1"
+    local -r version="$2"
+
+    local -r verifyURL="https://github.com/keeweb/keeweb/releases/download/v$version/Verify.sha256"
+    local    checkedFile verifyFile
+    local -i exitCode=0
+    local    output
+
+    output="$( mktemp )"
+    verifyFile="$( mktemp )"
+    output::listItemPending 'verifying downloaded file signature' "$LIST_ITEM_INDENT"
+    log::addMessage "verifying downloaded file signature (verifyURL = '$verifyURL')"
+
+    scrollingRegion::create --full-window 5
+
+    exitCode=0
+    download::get "$verifyURL" "$verifyFile" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to verify downloaded AppImage file (download Verify.sha256 file failed)' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to download Verify.sha256 file'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    elif [[ "$( sha256sum "$checkedFile" | cut -d' ' -f 1 )" != "$( grep .linux.AppImage "$verifyFile" | cut -d' ' -f 1 )" ]]
+    then
+        exitCode=1
+        output::listItemError 'failed to verify downloaded AppImage file (wrong signature)' "$LIST_ITEM_INDENT"
+        log::addMessage 'wrong signature for downloaded file'
+    else
+        output::listItemSuccess 'downloaded file signature verified' "$LIST_ITEM_INDENT"
+        log::addMessage 'downloaded file signature verified'
+    fi
+
+    [[ ! -f "$output" ]] || rm "$output"
+    [[ ! -f "$verifyFile" ]] || rm "$verifyFile"
+
+    return $exitCode
+}
+declare -rf keeweb::verify
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/download.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+source "$PROJECT_ROOT/lib/software-parse-opt.lib.sh"
+
+keeweb::main "$@"

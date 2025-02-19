@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function dockerDesktop::downloadDebFile() {
+    local -r debFile="$1"
+
+    local -i exitCode=0
+    local    fileExisted=false
+    local    output
+    local -r url='https://desktop.docker.com/linux/main/amd64/docker-desktop-amd64.deb'
+
+    output::listItemPending 'downloading package' "$LIST_ITEM_INDENT"
+
+    log::addMessage "downloading deb file at '$url'"
+
+    if [[ -f "$debFile" ]]
+    then
+        fileExisted=true
+    fi
+
+    output="$( mktemp )"
+    scrollingRegion::create --full-window --header-min-height 1 5
+    download::get "$url" "$debFile" |& tee "$output" || exitCode=$?
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError "failed to download package from '$url'" "$LIST_ITEM_INDENT"
+        log::addMessage "failed to download deb file (exit code: $exitCode)"
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+        if [[ -f "$debFile" ]] && ! $fileExisted
+        then
+            rm "$debFile"
+        fi
+    else
+        output::listItemSuccess 'package downloaded' "$LIST_ITEM_INDENT"
+        log::addMessage 'deb file download completed'
+    fi
+
+    rm -f "$output"
+
+    return $exitCode
+}
+declare -rf dockerDesktop::downloadDebFile
+
+function dockerDesktop::installPackage() {
+    local -r debFile="$1"
+
+    local    output
+    local -i exitCode
+
+    output::listItemPending 'installing package' "$LIST_ITEM_INDENT"
+    log::addMessage 'installing deb package'
+
+    scrollingRegion::create --full-window --header-min-height 1 5
+
+    exitCode=0
+    output="$( mktemp )"
+
+    packageManager::installRepository \
+        --components stable \
+        --key-url https://download.docker.com/linux/ubuntu/gpg \
+        docker-desktop \
+        https://download.docker.com/linux/ubuntu \
+        |& tee "$output" && \
+    packageManager::install \
+        'install docker-desktop' "$debFile" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install docker-desktop.deb package' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install docker-desktop.deb package'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess "package installed" "$LIST_ITEM_INDENT"
+        log::addMessage 'package installed'
+    fi
+
+    log::addMessage 'removing deb file'
+    rm "$debFile" "$output"
+    log::addMessage 'deb file removed'
+
+    return $exitCode
+}
+declare -rf dockerDesktop::installPackage
+
+function dockerDesktop::installPrerequisites() {
+    local    output
+    local -i exitCode=0
+
+    output::listItemPending 'installing software requirements' "$LIST_ITEM_INDENT"
+    log::addMessage 'installing software requirements'
+
+    output="$( mktemp )"
+    scrollingRegion::create --full-window --header-min-height 1 5
+    packageManager::install 'install software requirements' libasound2t64 |& tee "$output" || exitCode=$?
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install software requirements' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to install software requirements'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'software requirements installed' "$LIST_ITEM_INDENT"
+        log::addMessage 'software requirements installed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf dockerDesktop::installPrerequisites
+
+function dockerDesktop::main() {
+    local -r debFile='./docker-desktop-amd64.deb'
+
+    log::addMessage 'install docker-desktop'
+
+    softwareParseOpt "$@" || return $?
+    dockerDesktop::removeOldPackages || return $?
+    dockerDesktop::installPrerequisites || return $?
+    dockerDesktop::downloadDebFile "$debFile" || return $?
+    dockerDesktop::installPackage "$debFile" || return $?
+    dockerDesktop::startService || return $?
+}
+declare -rf dockerDesktop::main
+
+function dockerDesktop::removeOldPackages() {
+    local -i exitCode=0
+    local    output
+
+    output::listItemPending 'removing old docker packages' "$LIST_ITEM_INDENT"
+    log::addMessage 'removing old docker packages'
+
+    output="$( mktemp )"
+    scrollingRegion::create --full-window --header-min-height 1 5
+    packageManager::remove 'remove old docker packages' docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc |& tee "$output" || exitCode=$?
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to remove old docker packages' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to remove old docker packages'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'old docker packages removed' "$LIST_ITEM_INDENT"
+        log::addMessage 'old docker packages removed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf dockerDesktop::removeOldPackages
+
+function dockerDesktop::startService() {
+    local -i exitCode=$?
+    local    output
+
+    output::listItemPending 'start docker-desktop service' "$LIST_ITEM_INDENT"
+    log::addMessage 'starting docker-desktop service'
+    output="$( mktemp )"
+    systemctl --user start docker-desktop &>"$output" || exitCode=$?
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to start docker-desktop service' "$LIST_ITEM_INDENT"
+        log::addMessage 'failed to start docker-desktop service'
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'docker-desktop service is started' "$LIST_ITEM_INDENT"
+        log::addMessage 'docker-desktop service started'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf dockerDesktop::startService
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/download.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+source "$PROJECT_ROOT/lib/software-parse-opt.lib.sh"
+
+dockerDesktop::main "$@"
