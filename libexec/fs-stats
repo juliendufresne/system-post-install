@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+shopt -s extglob; # for string expansion
+
+declare -g EVENT_NAME
+
+# create dir recursively to give the right perms to every created folder
+function createDir() {
+    local -r dir="$1"
+    local    parentDir
+
+    if [[ -d "$dir" ]]
+    then
+        return 0
+    fi
+
+    parentDir="$( dirname "$dir" )"
+    if [[ "$parentDir" != '.' ]]
+    then
+        createDir "$parentDir"
+    fi
+
+    mkdir "$dir"
+    # case: run in sudo to access more files
+    # not handle case where parent folder is owned by root (ex: /tmp)
+    chown "$( stat -c "%U:%G" "$parentDir" )" "$dir"
+
+    return 0
+}
+
+function sanitize() {
+    local name="${1?need a string}"
+
+    name="${name//[^[:alnum:]]/-}"  # replace all non-alnum characters to -
+    name="${name//+(-)/-}"          # convert multiple - to single -
+    name="${name/#-}"               # remove - from start
+    name="${name/%-}"               # remove - from end
+    printf '%s\n' "${name,,}"       # convert to lowercase
+}
+
+function getSectionPath() {
+    declare    statsDir="${1?missing stats dir}"
+    declare -r sectionName="${2?missing stats dir}"
+    declare    cleanSectionName
+    declare -i lastSectionId=0
+    declare    sectionId
+    declare    lastSectionName=
+
+    cleanSectionName="$( sanitize "$sectionName" )"
+
+    if [[ ${#statsDir} -gt 1 && ${statsDir: -1} == '/' ]]
+    then
+        statsDir="${statsDir:0: -1}"
+    fi
+
+    createDir "$statsDir"
+
+    while IFS= read -r file
+    do
+        sectionId="${file##*/}"
+        sectionId="${sectionId%%-*}"
+
+        [[ $sectionId =~ ^[0-9]+$ ]] || continue
+
+        if [[ $sectionId -ge $lastSectionId ]]
+        then
+            lastSectionId=$sectionId
+            lastSectionName="$file"
+        fi
+
+        if [[ $file == "$statsDir/$sectionId-$cleanSectionName" ]]
+        then
+            printf '%s\n' "$( realpath "$file" )"
+            return 0
+        fi
+    done < <( find "$statsDir" -mindepth 1 -maxdepth 1 -type d )
+
+    # case we didn't provide a section name => get the last
+    if [[ -z "$sectionName" ]]
+    then
+        if [[ -z "$lastSectionName" ]]
+        then
+            printf '%s\n' "$( realpath "$statsDir/default-section" )"
+        else
+            printf '%s\n' "$( realpath "$lastSectionName" )"
+        fi
+    elif [[ ! -v sectionId ]]
+    then
+        printf '%s\n' "$( realpath "$statsDir/0-$cleanSectionName" )"
+    else
+        ((++lastSectionId))
+        printf '%s\n' "$( realpath "$statsDir/$lastSectionId-$cleanSectionName" )"
+    fi
+}
+
+function recordEvent() {
+    local -r statsDir="${1?missing stats dir}"
+    local -r sectionName="${2?missing section name}"
+    local -r eventName="${3?missing event name}"
+    local -a previousEvents=()
+    local    withSizeFilename
+    local    eventBasename
+    local    sectionPath
+    local    file
+    local    previousEvent
+
+    sectionPath="$( getSectionPath "$statsDir" "$sectionName" )"
+
+    createDir "$sectionPath/filesystem-content/with-size"
+    while IFS= read -r file
+    do
+        previousEvents+=("$file")
+    done < <( find "$sectionPath/filesystem-content/with-size" -name '[0-9]*.txt' )
+
+    # My event => 1-my-event
+    eventBasename="${#previousEvents[@]}-$( sanitize "$eventName" )"
+    sync
+
+    # get current filesystem content
+    find /                                      \
+           -not \( -path /dev         -prune \) \
+           -not \( -path /mnt         -prune \) \
+           -not \( -path /proc        -prune \) \
+           -not \( -path /sys         -prune \) \
+           -not \( -path /tmp         -prune \) \
+           -not \( -path "$STATS_DIR" -prune \) \
+           -not -type d                         \
+           -print                               \
+        > "$sectionPath/filesystem-content/$eventBasename.txt" \
+        2> /dev/null || true
+    chown "$( stat -c '%U:%G' "$sectionPath/filesystem-content" )" "$sectionPath/filesystem-content/$eventBasename.txt"
+
+    withSizeFilename="$sectionPath/filesystem-content/with-size/$eventBasename.txt"
+    # get current filesystem content with file size
+    find /                                      \
+           -not \( -path /dev         -prune \) \
+           -not \( -path /mnt         -prune \) \
+           -not \( -path /proc        -prune \) \
+           -not \( -path /sys         -prune \) \
+           -not \( -path /tmp         -prune \) \
+           -not \( -path "$STATS_DIR" -prune \) \
+           -not -type d                         \
+           -exec du -a {} +                     \
+        > "$withSizeFilename"                   \
+        2> /dev/null || true
+
+    # add total size
+    du -s /                        \
+            --exclude=/dev         \
+            --exclude=/mnt         \
+            --exclude=/proc        \
+            --exclude=/sys         \
+            --exclude=/tmp         \
+            --exclude="$STATS_DIR" \
+         >> "$withSizeFilename"    \
+         2> /dev/null || true
+
+    # add total size humanly readable
+    du -hs /                        \
+             --exclude=/dev         \
+             --exclude=/mnt         \
+             --exclude=/proc        \
+             --exclude=/sys         \
+             --exclude=/tmp         \
+             --exclude="$STATS_DIR" \
+        >> "$withSizeFilename"      \
+        2> /dev/null || true
+    chown "$( stat -c '%U:%G' "$sectionPath/filesystem-content/with-size" )" \
+          "$withSizeFilename"
+
+    if [[ ${#previousEvents[@]} -gt 0 ]]
+    then
+        createDir "$sectionPath/diff/$eventBasename"
+    fi
+
+    # perform a diff for each event
+    for file in "${previousEvents[@]}"
+    do
+        previousEvent="${file##*/}"
+        diff --side-by-side \
+             --suppress-common-lines \
+             "$file" \
+             "$sectionPath/filesystem-content/with-size/$eventBasename.txt" \
+            > "$sectionPath/diff/$eventBasename/$previousEvent" || true
+        chown "$( stat -c '%U:%G' "$sectionPath/diff/$eventBasename" )" \
+              "$sectionPath/diff/$eventBasename/$previousEvent"
+    done
+}
+
+while [[ $# -gt 0 ]]
+do
+    case "$1" in
+        --section|-s)
+            if [[ "$#" -eq 1 ]]
+            then
+                error "Missing value for option $1"
+                exit 1
+            fi
+            STATS_SECTION="$2"
+            shift 2
+            ;;
+        --section=*|-s=*)
+            STATS_SECTION="${1#*=}"
+            shift
+            ;;
+        --stats-dir|--dir|-d)
+            if [[ "$#" -eq 1 ]]
+            then
+                error "Missing value for option $1"
+                exit 1
+            fi
+            STATS_DIR="$( realpath "$2" )"
+            shift 2
+            ;;
+        --stats-dir=*|--dir=*|-d=*)
+            STATS_DIR="$( realpath "${1#*=}" )"
+            shift
+            ;;
+        *)
+            if [[ -v EVENT_NAME ]]
+            then
+                error "Too many arguments. Can only specify one event name. Already got '$EVENT_NAME' but found '$1'."
+                exit 1
+            fi
+            EVENT_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ ! -v STATS_DIR ]]
+then
+    STATS_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &>/dev/null && pwd )"
+    printf >&2 "\e[38;5;3mSTATS_DIR is not defined. Using %s's directory for stats.\e[39m\n" "${0}"
+else
+    STATS_DIR="$( realpath "$STATS_DIR" )"
+fi
+
+if [[ ! -v EVENT_NAME ]]
+then
+    EVENT_NAME='event'
+    printf >&2 '\e[38;5;3mNo event name defined. Using %s.\e[39m\n' "$EVENT_NAME"
+fi
+
+recordEvent "$STATS_DIR" "${STATS_SECTION:-}" "$EVENT_NAME"

@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function sshKey::addToAgent() {
+    local -r sshFilename="$1"
+
+    local -i exitCode=0
+
+    # Ensure agent is running
+    ssh-add -l &>/dev/null || exitCode=$?
+    if [[ $exitCode == 2 ]]
+    then
+        # Could not open a connection to your authentication agent.
+
+        # Load stored agent connection info.
+
+        if [[ -r ~/.ssh-agent ]]
+        then
+            eval "$( <~/.ssh-agent )" >/dev/null || true
+        fi
+
+        exitCode=0
+        ssh-add -l &>/dev/null || exitCode=$?
+        if [[ $exitCode -eq 2 ]]
+        then
+            # Start agent and store agent connection info.
+            (umask 066; ssh-agent > ~/.ssh-agent)
+            eval "$( <~/.ssh-agent )" >/dev/null
+        fi
+    fi
+
+    # Load identities
+    ssh-add -l &>/dev/null || true
+
+    log::addMessage 'add to ssh-agent'
+    ssh-add ~/.ssh/"$sshFilename"
+}
+declare -rf sshKey::addToAgent
+
+function sshKey::addToHost() {
+    local sshFilename="$1"
+    local provider="$2"
+    local hostname="$3"
+
+    local host="$sshFilename"
+
+    provider="${provider,,}"
+
+    if [[ $sshFilename != "$provider" ]]
+    then
+        host+="-$provider"
+    fi
+
+    touch ~/.ssh/config
+    chmod 0600 ~/.ssh/config
+
+    # remove previously defined host if exists
+    if grep -q "Host[[:blank:]][[:blank:]]*$host" ~/.ssh/config
+    then
+        awk -i inplace -v host="$host" \
+            'BEGIN { flag = 1 } $1 == "Host" { if ($2 == host) flag = 0; else flag = 1 } flag;' \
+            ~/.ssh/config
+    fi
+
+    cat << ! >> ~/.ssh/config
+
+Host $host
+    HostName $hostname
+    User     git
+    AddKeysToAgent yes
+    IdentitiesOnly yes
+    IdentityFile ~/.ssh/$sshFilename
+!
+}
+declare -rf sshKey::addToHost
+
+function sshKey::askFilename() {
+    local -r bashOptions="$-"
+    local -i exitCode=0
+    local    sshFilename
+
+    while true
+    do
+        set +x
+        sshFilename="$( dialog::ask "$DIALOG_TITLE" 'Private SSH key filename' )" || exitCode=$?
+        set "-$bashOptions"
+
+        [[ $exitCode -eq 0 && -n $sshFilename ]] || return 221
+
+        if [[ $sshFilename =~ ^[[:alnum:]_-]*$ ]]
+        then
+            printf '%s\n' "$sshFilename"
+
+            return 0
+        fi
+
+        output::warning "Wrong file name: special characters '${sshFilename//[[:alnum:]_-]/}' are not allowed."
+        output::pressKeyToContinue
+        output::cleanPreviousLines 4
+    done
+}
+declare -rf sshKey::askFilename
+
+function sshKey::generate() {
+    local -n _privateKeyName="$1"
+
+    local bashOptions="$-"
+    local sshFilename passphrase comment
+
+    if ! sshFilename="$( sshKey::askFilename )"
+    then
+        output::warning 'SSH key generation canceled'
+        log::addMessage 'canceled'
+
+        return 221
+    fi
+
+    _privateKeyName="$sshFilename"
+
+    if [[ -f ~/.ssh/"$sshFilename" ]]
+    then
+        log::addMessage "ssh filename '~/.ssh/$sshFilename' already exists"
+        style::listItemWarning "SSH key '$sshFilename' already exists"
+
+        return 0
+    fi
+    log::addMessage "using filename '~/.ssh/$sshFilename'"
+
+    log::addMessage 'ask for passphrase and comment'
+    set +x
+    if ! passphrase="$( dialog::askPass "$DIALOG_TITLE" "passphrase for key $sshFilename" )" \
+    || ! comment="$( dialog::ask "$DIALOG_TITLE" "Comment for key $sshFilename" )"
+    then
+        set "-$bashOptions"
+        output::warning 'SSH key generation canceled'
+        log::addMessage 'canceled'
+
+        return 221
+    fi
+    set "-$bashOptions"
+
+    log::addMessage 'ensure ~/.ssh dir exists with 0700 permissions'
+    install -m 0700 -d ~/.ssh || return $?
+
+    log::addMessage 'generate key'
+    ssh-keygen -t ed25519 -q -f ~/.ssh/"$sshFilename" -N "$passphrase" -C "$comment"
+    log::addMessage 'make generated keys only accessible for current user'
+    chmod 0600 ~/.ssh/"$sshFilename" ~/.ssh/"$sshFilename".pub
+
+    sshKey::addToAgent "$sshFilename"
+}
+declare -rf sshKey::generate
+
+function sshKey::main() {
+    local    privateKeyName
+    local    provider
+    local -a providerLinks=()
+
+    log::addMessage "${0##*/} $*"
+
+    if ! command -v ssh &>/dev/null
+    then
+        output::error 'ssh is not installed' >&2
+        log::addMessage 'missing ssh command'
+
+        return 1
+    fi
+
+    if ! dialog::hasDialogRequirements
+    then
+        dialog::installDialogBox || return $?
+    fi
+
+    sshKey::generate privateKeyName || return $?
+
+    for provider in $( sshKey::selectProviders )
+    do
+        log::addMessage "selected provider '$provider'"
+        case "$provider" in
+            Bitbucket)
+                providerLinks+=("Open $( output::link 'https://bitbucket.org/account/settings/ssh-keys/' 'Bitbucket' ) settings")
+                sshKey::addToHost "$privateKeyName" "$provider" 'bitbucket.org'
+                ;;
+            GitHub)
+                providerLinks+=("Open $( output::link 'https://github.com/settings/keys' 'GitHub' ) settings")
+                sshKey::addToHost "$privateKeyName" "$provider" 'github.com'
+                ;;
+            GitLab)
+                providerLinks+=("Open $( output::link 'https://gitlab.com/-/user_settings/ssh_keys' 'GitLab' ) settings")
+                sshKey::addToHost "$privateKeyName" "$provider" 'gitlab.com'
+                ;;
+        esac
+    done
+
+    log::addMessage 'show SSH public key'
+
+    output::info 'Here is your public key. Put it where needed.'
+
+    printf -- '-----BEGIN SSH KEY ~/.ssh/%s.pub -----\n' "$privateKeyName"
+    cat ~/.ssh/"$privateKeyName".pub
+    printf -- '-----END SSH KEY ~/.ssh/%s.pub -----\n' "$privateKeyName"
+
+    case "${#providerLinks[@]}" in
+        0) ;;
+        1) printf '%s\n' "${providerLinks[0]}" ;;
+        *) output::listing "${providerLinks[@]}" ;;
+    esac
+
+    output::pressKeyToContinue
+
+    return 0
+}
+declare -rf sshKey::main
+
+function sshKey::selectProviders() {
+    local -a menuItems=()
+
+    menuItems+=('GitHub')
+    menuItems+=('Generates an SSH key for github.com')
+    menuItems+=('OFF')
+
+    menuItems+=('GitLab')
+    menuItems+=('Generates an SSH key for gitlab.com')
+    menuItems+=('OFF')
+
+    menuItems+=('Bitbucket')
+    menuItems+=('Generates an SSH key for bitbucket.org')
+    menuItems+=('OFF')
+
+    dialog::checklistMenu "$DIALOG_TITLE" 'Will this SSH key be used for a known provider?' "${menuItems[@]}" || true
+}
+declare -rf sshKey::selectProviders
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare -g PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/config.lib.sh"
+source "$PROJECT_ROOT/lib/dialog.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+
+declare -rg DIALOG_TITLE='SSH key generation'
+
+sshKey::main "$@"

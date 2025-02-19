@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function git::main() {
+    local    output
+    local -i exitCode
+
+    log::addMessage 'install git'
+
+    output::pending 'installing package'
+    log::addMessage 'installing package'
+
+    scrollingRegion::create --full-window 5
+
+    exitCode=0
+    output="$( mktemp )"
+
+    packageManager::installRepository \
+        --key-id F911AB184317630C59970973E363C90F8F1B6217 \
+        git \
+        https://ppa.launchpadcontent.net/git-core/ppa/ubuntu \
+        |& tee "$output" && \
+    packageManager::install \
+        'install git' git |& tee -a "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::error 'failed to install git'
+        log::addMessage 'failed to install git'
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::success 'git installation completed'
+        log::addMessage 'git installation completed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf git::main
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+
+git::main

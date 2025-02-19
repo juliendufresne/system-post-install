@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function spotify::main() {
+    local -i exitCode
+
+    output::pending 'installing package'
+    log::addMessage 'installing snap package'
+
+    scrollingRegion::create --full-window 5
+
+    exitCode=0
+    output="$( mktemp )"
+    packageManager::snapInstall 'install spotify' spotify |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::error 'failed to install spotify'
+        log::addMessage 'failed to install spotify'
+
+        output::showErrorOutputFromFile "$output" >&2
+    else
+        output::success 'spotify installation completed'
+        log::addMessage 'spotify installation completed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf spotify::main
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+
+spotify::main

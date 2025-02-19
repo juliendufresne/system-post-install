@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ——— Global variables —————————————————————————————————————————————————————————
+
+declare -g PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+declare -g  USE_DEFAULT=false # will ask what to install
+declare -ga PICKED_SOFTWARE=()
+declare -gr SOFTWARE_INSTALLER_DIR="$PROJECT_ROOT/software"
+declare -g  WITH_STATS=true
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function install::installPickedSoftware() {
+    local software
+
+    output::section 'Install selected software'
+    log::addMessage 'Install selected software'
+
+    for software in "${PICKED_SOFTWARE[@]}"
+    do
+        install::oneSoftware "$software" || return $?
+    done
+
+    stats::wait
+
+    return 0
+}
+declare -rf install::installPickedSoftware
+
+function install::main() {
+    log::addMessage "running script '$0 $*'"
+    clear
+
+    while [[ $# -gt 0 ]]
+    do
+        # shellcheck disable=SC2034
+        case "$1" in
+            --stats) WITH_STATS=true; shift;;
+            --no-stats) WITH_STATS=false; shift;;
+            --default) USE_DEFAULT=true; shift;;
+            -h|--help) install::usage >&2; exit 0;;
+            -*)
+                output::error "Unknown option '$1'." >&2
+                install::usage >&2
+                exit 2
+                ;;
+            *)
+                output::error "Unknown argument '$1'." >&2
+                install::usage >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    install::prepare || return $?
+    install::installPickedSoftware
+    install::workspace
+}
+declare -rf install::main
+
+function install::oneSoftware() {
+    local -r name="$1"
+
+    local -i exitCode
+    local -a newSoftwareList=()
+    local -a options=("--indent" 6)
+    local    output
+    local    software
+
+    if $USE_DEFAULT
+    then
+        options+=("--default")
+    fi
+
+    output="$( mktemp )"
+
+    output::listItemPending "installing $name"
+    stats::wait
+    stats::run "before install $name"
+
+    scrollingRegion::create --full-window 5
+
+    exitCode=0
+    # run install software.
+    # Note: installer script was present and executable when user picked it.
+    "$SOFTWARE_INSTALLER_DIR/$name" "${options[@]}" |& tee >&2 "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    stats::runAsync "after install $name"
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError "failed to install software $name"
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess "software $name installed"
+    fi
+
+    rm "$output"
+
+    # removed install software from list
+    for software in "${PICKED_SOFTWARE[@]}"
+    do
+        [[ $software == "$name" ]] || newSoftwareList+=("$software")
+    done
+    PICKED_SOFTWARE=("${newSoftwareList[@]}")
+
+    return $exitCode
+}
+declare -rf install::oneSoftware
+
+function install::prepare() {
+    local -i exitCode=0
+    local    processId=""
+
+    output::section "Prepare installation"
+    stats::runAsync "start script"
+
+    # »»» Script pre-requisites ————————————————————————————————————————————————
+
+    install::scriptRequirements || return $?
+
+    # »»» ask password-less sudo ———————————————————————————————————————————————
+
+    install::prepareSudo || return $?
+
+    # »»» ask upgrade system ———————————————————————————————————————————————————
+
+    install::upgradeSystemAsync processId || return $?
+
+    # »»» ask software wishlist ————————————————————————————————————————————————
+
+    install::selectSoftware || exitCode=$? # need to wait for system upgrade to finish
+
+    # »»» wait for system upgrade ——————————————————————————————————————————————
+
+    if [[ -n "$processId" ]]
+    then
+        if ps -p "$processId" &>/dev/null
+        then
+            output::listItemPending "system is still being upgraded"
+            wait "$processId"
+            output::cleanPreviousLines 1
+        fi
+        output::listItemSuccess "system upgraded"
+    fi
+
+    return $exitCode
+}
+declare -rf install::prepare
+
+function install::prepareSudo() {
+    local -i exitCode=0
+    local -a scriptOptions=("--exit-status")
+    local    output
+
+    output::listItemPending 'checking sudo permissions'
+    log::addMessage 'checking sudo permissions'
+
+    scrollingRegion::create --full-window --header-min-height 3 10
+
+    output="$( mktemp )"
+    if $USE_DEFAULT
+    then
+        scriptOptions+=("--default")
+    fi
+
+    log::addMessage "running script '$PROJECT_ROOT/tools/sudo-password-less' with options '${scriptOptions[*]}'"
+    "$PROJECT_ROOT/tools/sudo-password-less" "${scriptOptions[@]}" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    case $exitCode in
+        0)
+            log::addMessage 'sudo permissions updated'
+            output::listItemSuccess 'sudo permissions updated'
+            ;;
+        101)
+            log::addMessage 'sudo permissions: root user'
+            output::listItemSuccess 'sudo permissions: root user'
+            ;;
+        102)
+            log::addMessage 'sudo permissions checked'
+            output::listItemSuccess 'sudo permissions checked'
+            ;;
+        221)
+            log::addMessage 'checking sudo permissions canceled'
+            output::listItemWarning 'checking sudo permissions canceled'
+            ;;
+        *)
+            log::addMessage "checking sudo permissions failed (exit code '$exitCode')"
+            output::listItemError "something went wrong while checking sudo permissions (error status: $exitCode)"
+            output::showErrorOutputFromFile "$output" >&2
+            log::addFile "$output"
+
+            rm "$output"
+
+            return $exitCode
+            ;;
+    esac
+
+    rm "$output"
+
+    return 0
+}
+declare -rf install::prepareSudo
+
+function install::scriptRequirements() {
+    local -i exitCode=0
+    local    output
+
+    if download::hasDownloaderRequirements && ( $USE_DEFAULT || dialog::hasDialogRequirements )
+    then
+        output::listItemSuccess 'packages required by the script are all present'
+
+        return 0
+    fi
+
+    output::listItemPending 'installing packages required by the installer'
+
+    stats::wait
+    output="$( mktemp )"
+
+    scrollingRegion::create --full-window --header-min-height 3 10
+
+    download::installDownloader |& tee -a "$output" >&2 || exitCode=$?
+    scrollingRegion::restore
+
+    scrollingRegion::create --full-window --header-min-height 3 10
+    if [[ $exitCode -eq 0 ]] && ! $USE_DEFAULT
+    then
+        dialog::installDialogBox |& tee -a "$output" >&2 || exitCode=$?
+    fi
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'failed to install script requirements'
+        output::showErrorOutputFromFile "$output" >&2
+    else
+        stats::runAsync 'after install prerequisite'
+        output::listItemSuccess 'packages required by the script installed'
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf install::scriptRequirements
+
+function install::selectSoftware() {
+    local -a selectedSoftwareList=()
+    local -a errors=()
+    local    softwareName
+
+    output::listItemPending 'picking software to install'
+    log::addMessage 'picking software to install'
+
+    if $USE_DEFAULT
+    then
+        config::software::getPreference selectedSoftwareList
+        log::addMessage "using default software list '${selectedSoftwareList[*]}'."
+    elif ! config::software::choose selectedSoftwareList
+    then
+        output::cleanPreviousLines 1
+        output::listItemWarning 'software selection canceled'
+        log::addMessage 'software selection canceled by user'
+
+        return 221
+    fi
+
+    # »»» handling errors ——————————————————————————————————————————————————————
+
+    # Handling it here because there might be multiple places where we install.
+    # This is most likely developer errors.
+    errors=()
+    for softwareName in "${selectedSoftwareList[@]}"
+    do
+        if [[ ! -f "$SOFTWARE_INSTALLER_DIR/$softwareName" ]]
+        then
+            log::addMessage "software '$softwareName': installer file '$SOFTWARE_INSTALLER_DIR/$softwareName' does not exist"
+            errors+=("missing installer file for software '$softwareName'.")
+        elif [[ ! -x "$SOFTWARE_INSTALLER_DIR/$softwareName" ]]
+        then
+            log::addMessage "software '$softwareName': installer file '$SOFTWARE_INSTALLER_DIR/$softwareName' is not executable"
+            errors+=("installer file is not executable for software '$softwareName'.")
+        else
+            log::addMessage "adding software '$softwareName'."
+            PICKED_SOFTWARE+=("$softwareName")
+        fi
+    done
+
+    output::cleanPreviousLines 1
+    if [[ ${#errors[@]} -gt 0 ]]
+    then
+        if [[ ${#PICKED_SOFTWARE[@]} -eq 0 ]]
+        then
+            output::listItemError 'none of the selected software can be installed'
+        else
+            output::listItemWarning 'some of the selected software cannot be installed'
+        fi
+
+        if [[ ${#errors[@]} -gt 1 ]]
+        then
+            output::pad 5 "$( output::listing "${errors[@]}" )" >&2
+        else
+            output::pad 5 "${errors[0]}" >&2
+        fi
+
+        return 1
+    fi
+
+    if [[ ${#PICKED_SOFTWARE[@]} -eq 0 ]]
+    then
+        log::addMessage 'software selection: none selected.'
+        output::listItemWarning 'no software selected'
+    else
+        output::listItemSuccess "${#PICKED_SOFTWARE[@]} software selected"
+    fi
+
+    return 0
+}
+declare -rf install::selectSoftware
+
+function install::upgradeSystemAsync() {
+    local -n _pid="$1"
+
+    local    asyncProcess
+    local    asyncProcess_PID=
+    local    bashOptions="$-"
+    local -i exitCode
+    local    preference=true
+
+    _pid=
+    preference="$( config::systemUpgrade::getPreference )"
+
+    if ! $USE_DEFAULT
+    then
+        log::addMessage "asking user if wants to upgrade system (default: '$preference')"
+        set +x
+        if dialog::confirm 'System Upgrade' 'Do you want to upgrade your system?' "$preference"
+        then
+            preference=true
+        else
+            preference=false
+        fi
+        set "-$bashOptions"
+        config::systemUpgrade::savePreference "$preference"
+    fi
+
+    if ! $preference
+    then
+        log::addMessage 'do not upgrade the system'
+
+        return 0
+    fi
+
+    exitCode=0
+    # ensure no asked password during async
+    sudo::validate 'upgrade the system' || exitCode=$?
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        log::addMessage 'system upgrade: failed to authenticate'
+        output::error 'Authentication failed.' >&2
+
+        return $exitCode
+    fi
+
+    log::addMessage 'start upgrading system asynchronously'
+    coproc::waitForPrevious
+    # shellcheck disable=SC2034
+    coproc asyncProcess {
+        stats::wait
+        stats::run 'before system upgrade'
+        packageManager::upgrade 'upgrade the system'
+        stats::run 'after system upgrade'
+    }
+    coproc::register "$asyncProcess_PID"
+    _pid="$asyncProcess_PID"
+
+    return 0
+}
+declare -rf install::upgradeSystemAsync
+
+function install::usage() {
+    printf 'usage: '
+    output::color::green "${0##*/}"
+    printf ' ['
+    output::color::yellow '--default'
+    printf '] ['
+    output::color::yellow '--(no-)stats'
+    printf ']\n'
+}
+declare -rf install::usage
+
+function install::workspace() {
+    local -r bashOptions="$-"
+    local -i exitCode=0
+    local    software
+    local    directory
+
+    # We won't auto-generate gpg/ssh keys as it would require versioning data
+    if $USE_DEFAULT
+    then
+        return 0
+    fi
+
+    output::section 'Workspace(s)'
+
+    set +x
+    while directory="$( dialog::ask 'Workspace creation' 'Workspace directory' "$( config::workspaceRootDir::getPreference )/" )"
+    do
+        set "-$bashOptions"
+        config::workspaceRootDir::savePreference "$( dirname "$directory" )"
+        export SHELLOPTS
+        output::listItemSuccess "Workspace ${directory/$HOME}"
+        # workspace errors doesn't prevent from installing software
+        "$PROJECT_ROOT/tools/workspace" --indent 6 "$directory" || exitCode=$?
+        case $exitCode in
+            221)
+                output::warning 'Workspace creation canceled'
+                break
+                ;;
+        esac
+
+        set +x
+        dialog::confirm 'Workspace creation' 'Do you want to create another workspace?' false || break
+    done
+    set "-$bashOptions"
+
+    return 0
+}
+declare -rf install::workspace
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+source "$PROJECT_ROOT/lib/config.lib.sh"
+source "$PROJECT_ROOT/lib/coproc.lib.sh"
+source "$PROJECT_ROOT/lib/dialog.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/package-manager.lib.sh"
+source "$PROJECT_ROOT/lib/stats.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+source "$PROJECT_ROOT/lib/sudo.lib.sh"
+
+install::main "$@"
+

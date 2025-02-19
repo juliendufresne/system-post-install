@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s extglob; # for string expansion
+
+# ——— Functions definition —————————————————————————————————————————————————————
+
+function workspace::configureGitUser() { # $0 <workspace-dir>
+    local -r workspace="$1"
+
+    local -r bashOptions="$-"
+    local -i exitCode=0
+    local    userName userEmail
+
+    command -v git &>/dev/null || workspace::installSoftware 'git' || return $?
+
+    set +x
+    userName="$( dialog::ask 'Configure git for workspace' 'Git user name' )" || return $?
+    set "-$bashOptions"
+    [[ -n "$userName" ]] || return 1
+    set +x
+    userEmail="$( dialog::ask 'Configure git for workspace' 'Git email' )" || return $?
+    set "-$bashOptions"
+    [[ -n "$userEmail" ]] || return 1
+
+    output::listItemPending 'configuring git user' "$WORKSPACE_INDENT"
+
+    if ! gitConfig::set -f "$workspace/.gitconfig" user.name "$userName"
+    then
+        exitCode=1
+        output::cleanPreviousLines 1
+        output::listItemError \
+            "configuring git user: unable to set user.name to '$userName' in file '$workspace/.gitconfig'" \
+            "$WORKSPACE_INDENT"
+    fi
+
+    if ! gitConfig::set -f "$workspace/.gitconfig" user.email "$userEmail"
+    then
+        [[ $exitCode -eq 0 ]] || output::cleanPreviousLines 1
+        exitCode=1
+        output::listItemError \
+            "configuring git user: unable to set user.email to '$userEmail' in file '$workspace/.gitconfig'" \
+            "$WORKSPACE_INDENT"
+    fi
+
+    if ! gitConfig::get --global includeIf.gitdir:"${workspace//$HOME/\~}"/.path &>/dev/null \
+    && ! gitConfig::set --global includeIf.gitdir:"${workspace//$HOME/\~}"/.path "$workspace/.gitconfig"
+    then
+        [[ $exitCode -eq 0 ]] || output::cleanPreviousLines 1
+        exitCode=1
+        output::listItemError \
+            "configuring git user: unable to include file '$workspace/.gitconfig' to global gitconfig file" \
+            "$WORKSPACE_INDENT"
+    fi
+
+    if [[ $exitCode -eq 0 ]]
+    then
+        output::cleanPreviousLines 1
+        output::listItemSuccess 'git user configured' "$WORKSPACE_INDENT"
+    fi
+
+    return $exitCode
+}
+declare -rf workspace::configureGitUser
+
+function workspace::createDirectory() {
+    local -r directory="$1"
+
+    [[ ! -d "$directory" ]] || return 0
+
+    if mkdir -p "$directory" &>/dev/null
+    then
+        return 0
+    fi
+
+    {
+        output::warning "Unable to create directory '$directory'. Please create it or abort."
+        printf 'Press '
+        output::color::green 'Ctrl-C'
+        printf ' to abort.\n'
+    } >&2
+
+    sleep 5
+    while [[ ! -d "$directory" ]]
+    do
+        sleep 1
+    done
+}
+declare -rf workspace::createDirectory
+
+function workspace::createOne() { # $0 <dir>
+    local -r bashOptions="$-"
+    local    configureGitUser generateGPGKey generateSSHKey
+    local    directory directoryShortName
+    local -i exitCode=0
+
+    if ! directory="$( workspace::resolveDirectory "$1" )"
+    then
+        return 221
+    fi
+
+    directoryShortName="${directory//$PWD\/}"
+    directoryShortName="${directoryShortName//$HOME/\~}"
+
+    if [[ -d "$directory" ]]
+    then
+        set +x
+        dialog::confirm "Workspace $directoryShortName" \
+                        "Directory '$directory' already exist. Do you want to configure this workspace?" \
+                        true || exitCode=$?
+
+        set "-$bashOptions"
+
+        [[ $exitCode -eq 0 ]] || return 221
+    else
+        output::listItemPending 'Creating workspace directory' "$WORKSPACE_INDENT"
+
+        if ! workspace::createDirectory "$directory"
+        then
+            output::cleanPreviousLines 1
+            output::listItemError 'Workspace directory creation canceled' "$WORKSPACE_INDENT"
+
+            return 221
+        fi
+
+        output::cleanPreviousLines 1
+        output::listItemSuccess 'Workspace directory created' "$WORKSPACE_INDENT"
+    fi
+
+    read -r configureGitUser generateGPGKey generateSSHKey < <( workspace::getOptions "$directoryShortName" )
+
+    if $configureGitUser
+    then
+        workspace::configureGitUser "$directory" || exitCode=$?
+    fi
+
+    if $generateGPGKey
+    then
+        workspace::generateGPGKey "$directory" || exitCode=$?
+    fi
+
+    if $generateSSHKey
+    then
+        workspace::generateSSHKey || exitCode=$?
+    fi
+
+    return $exitCode
+}
+declare -rf workspace::createOne
+
+function workspace::generateGPGKey() {
+    local -i exitCode=0
+    local    output
+
+    command -v gpg &>/dev/null || workspace::installSoftware 'gpg' || return $?
+    command -v git &>/dev/null || workspace::installSoftware 'git' || return $?
+
+    output::listItemPending 'Generating GPG key' "$WORKSPACE_INDENT"
+
+    scrollingRegion::create --full-window --header-min-height 1 20
+
+    output="$( mktemp )"
+    export SHELLOPTS
+    "$PROJECT_ROOT"/tools/create-gpg-key --git --git-workspace "$1" \
+        |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+
+    output::cleanPreviousLines 1
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError 'GPG key generation failed' "$WORKSPACE_INDENT"
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess 'GPG key generated' "$WORKSPACE_INDENT"
+    fi
+
+    rm "$output"
+
+    return 0
+}
+declare -rf workspace::generateGPGKey
+
+function workspace::generateSSHKey() {
+    local -r bashOptions="$-"
+    local -i exitCode=0 nbGeneratedKey=0
+    local    output
+
+    command -v ssh &>/dev/null || workspace::installSoftware 'openssh-client' || return $?
+
+    output="$( mktemp )"
+    while true
+    do
+        output::listItemPending 'Generating an SSH key' "$WORKSPACE_INDENT"
+
+        scrollingRegion::create --full-window --header-min-height 1 20
+
+        export SHELLOPTS
+        "$PROJECT_ROOT"/tools/create-ssh-key |& tee "$output" || exitCode=$?
+
+        scrollingRegion::restore
+
+        if [[ $exitCode -ne 0 ]]
+        then
+            output::cleanPreviousLines 1
+            output::listItemError 'Error while generating an SSH key' "$WORKSPACE_INDENT"
+            output::showErrorOutputFromFile "$output" >&2
+            log::addFile "$output"
+
+            break
+        fi
+
+        ((++nbGeneratedKey))
+
+        if [[ $nbGeneratedKey -eq 1 ]]
+        then
+            output::cleanPreviousLines 1
+            output::listItemSuccess 'Generated 1 SSH key' "$WORKSPACE_INDENT"
+        else
+            output::cleanPreviousLines 2
+            output::listItemSuccess "Generated $nbGeneratedKey SSH keys" "$WORKSPACE_INDENT"
+        fi
+
+        set +x
+        dialog::confirm 'Workspace' \
+                        'Do you want to generate another SSH key?' \
+                        false || exitCode=$?
+        set "-$bashOptions"
+
+        if [[ $exitCode -ne 0 ]]
+        then
+            exitCode=0
+            break
+        fi
+    done
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf workspace::generateSSHKey
+
+function workspace::getOptions() { # $0 <workspace-name>
+    local -r workspaceName="$1"
+
+    local -r bashOptions="$-"
+    local -a menuOptions=()
+    local    configureGitUser generateGPGKey generateSSHKey
+    local    choice
+
+    configureGitUser="$( config::workspaceConfigureGitUser::getPreference )"
+    generateGPGKey="$( config::workspaceGenerateGPGKey::getPreference )"
+    generateSSHKey="$( config::workspaceGenerateSSHKey::getPreference )"
+
+    menuOptions+=('1)' 'Configure a specific git user')
+    $configureGitUser && menuOptions+=('ON') || menuOptions+=('OFF')
+    menuOptions+=('2)' 'Create dedicated GPG key for this workspace')
+    $generateGPGKey && menuOptions+=('ON') || menuOptions+=('OFF')
+    menuOptions+=('3)' 'Create dedicated SSH key(s) for this workspace')
+    $generateSSHKey && menuOptions+=('ON') || menuOptions+=('OFF')
+
+    configureGitUser=false
+    generateGPGKey=false
+    generateSSHKey=false
+    set +x
+    for choice in $( dialog::checklistMenu "Workspace '$workspaceName' options" 'Select your options' "${menuOptions[@]}" )
+    do
+        set "-$bashOptions"
+        case "$choice" in
+            '1)') configureGitUser=true ;;
+            '2)') generateGPGKey=true ;;
+            '3)') generateSSHKey=true ;;
+        esac
+    done
+    set "-$bashOptions"
+
+    config::workspaceConfigureGitUser::savePreference "$configureGitUser"
+    config::workspaceGenerateGPGKey::savePreference "$generateGPGKey"
+    config::workspaceGenerateSSHKey::savePreference "$generateSSHKey"
+
+    printf '%s %s %s\n' $configureGitUser $generateGPGKey $generateSSHKey
+}
+declare -rf workspace::getOptions
+
+function workspace::installSoftware() { # $0 <package-name>
+    local -r packageName="$1"
+
+    local -i exitCode=0
+    local    output
+
+    output::listItemPending "installing $packageName"
+
+    scrollingRegion::create --full-window --header-min-height 1 10
+
+    output="$( mktemp )"
+    "$PROJECT_ROOT/software/$packageName" |& tee "$output" || exitCode=$?
+
+    scrollingRegion::restore
+    output::cleanPreviousLines 1
+
+    if [[ $exitCode -ne 0 ]]
+    then
+        output::listItemError "failed to install $packageName"
+
+        output::showErrorOutputFromFile "$output" >&2
+        log::addFile "$output"
+    else
+        output::listItemSuccess "$packageName is installed"
+    fi
+
+    rm "$output"
+
+    return $exitCode
+}
+declare -rf workspace::installSoftware
+
+function workspace::main() {
+    local -i exitCode=0
+
+    # consume options
+    while [[ $# -gt 0 ]]
+    do
+        case "$1" in
+            --indent)
+                if [[ $# -eq 1 ]]
+                then
+                    output::error "${0##*/}: option $1 missing required parameter" >&2
+                    workspace::usage >&2
+
+                    return 2
+                fi
+
+                WORKSPACE_INDENT="$2"
+                shift 2
+                ;;
+            *) break ;;
+        esac
+    done
+
+    if [[ $# -eq 0 ]]
+    then
+        output::error "${0##*/}: missing <dir> argument" >&2
+        workspace::usage >&2
+
+        return 2
+    fi
+
+    if ! dialog::hasDialogRequirements
+    then
+        dialog::installDialogBox || return $?
+    fi
+
+    while [[ $# -gt 0 ]]
+    do
+        workspace::createOne "$1" || exitCode=$?
+        shift
+    done
+
+    return $exitCode
+}
+declare -rf workspace::main
+
+function workspace::resolveDirectory() { # $0 <dir>
+    local -r bashOptions="$-"
+    local    directory="$1"
+    local -i exitCode=0
+
+    if [[ ${#directory} -gt 1 && ${directory: -1} == '/' ]]
+    then
+        directory="${directory:0: -1}"
+    fi
+
+    if [[ ${directory:0:1} != '/' ]]
+    then
+        if [[ $HOME == "$PWD" ]]
+        then
+            set +x
+            dialog::confirm "Workspace $directory" \
+                            "Please confirm you want to create workspace $HOME/$directory" \
+                            true || exitCode=$?
+            set "-$bashOptions"
+
+            [[ $exitCode -eq 0 ]] || return 221
+
+            directory="$HOME/$directory"
+        else
+            set +x
+            case "$( dialog::menu "Workspace $directory" \
+                                  'Which workspace are you trying to create?' \
+                                  '1)' "$PWD/$directory" \
+                                  '2)' "$HOME/$directory" )" in
+                '1)') directory="$PWD/$directory" ;;
+                '2)') directory="$HOME/$directory" ;;
+                *) set "-$bashOptions"; return 221 ;;
+            esac
+            set "-$bashOptions";
+        fi
+    fi
+
+    printf '%s\n' "$directory"
+}
+declare -rf workspace::resolveDirectory
+
+function workspace::usage() {
+    printf 'usage: '
+    output::color::green "${0##*/}"
+    printf ' ['
+    output::color::yellow "--indent $( output::underline '<indent>' )"
+    printf '] '
+    output::color::yellow "$( output::underline '<dir>' )"
+    printf ' ['
+    output::color::yellow "$( output::underline '<dir>' ) ..."
+    printf ']\n'
+}
+declare -rf workspace::usage
+
+# ——— Script execution —————————————————————————————————————————————————————————
+
+declare -g PROJECT_ROOT
+PROJECT_ROOT="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+readonly PROJECT_ROOT
+
+source "$PROJECT_ROOT/lib/config.lib.sh"
+source "$PROJECT_ROOT/lib/dialog.lib.sh"
+source "$PROJECT_ROOT/lib/git-config.lib.sh"
+source "$PROJECT_ROOT/lib/log.lib.sh"
+source "$PROJECT_ROOT/lib/output.lib.sh"
+source "$PROJECT_ROOT/lib/scrolling-region.lib.sh"
+
+declare -gi WORKSPACE_INDENT=2
+
+workspace::main "$@"
