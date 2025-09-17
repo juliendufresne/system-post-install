@@ -22,7 +22,7 @@ function bootstrap::cloneBranch() {
         printf $'\e''[39m' >&2
         printf 'detected distribution: %s\n' "$branch" >&2
         printf 'Supported distributions\n' >&2
-        printf '-----------------------\n' >&2
+        printf -- '-----------------------\n' >&2
 
         printf '%s\n' "$allBranches" | while IFS= read -r branchFound
         do
