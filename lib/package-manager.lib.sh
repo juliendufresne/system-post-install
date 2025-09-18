@@ -248,16 +248,15 @@ function packageManager::installRepository() { # $0 [--key-id <key>] [--key-url 
         then
             log::addMessage "installing gpg key '$keyId'"
 
-            buildDir="$( mktemp -d )"
-            gpg --homedir "$buildDir" \
-                --no-default-keyring \
-                --keyring "$buildDir/key.gpg" \
-                --keyserver keyserver.ubuntu.com \
-                --recv-keys "$keyId" && \
-            sudo::run "$requirePasswordWarningMessage" \
-                install -g root -o root -m 0644 "$buildDir/key.gpg" "$keyring" || exitCode=$?
+            export GNUPGHOME="$( mktemp -d )"
 
-            rm -r "$buildDir"
+            echo "keyserver hkp://keyserver.ubuntu.com" > "$GNUPGHOME/dirmngr.conf" && \
+            gpgconf --kill dirmngr && \
+            gpg --recv-keys "$keyId" && \
+            gpg --export "$keyId" | sudo::run "$requirePasswordWarningMessage" tee "$keyring" && \
+            sudo chmod 644 "$keyring" || exitCode=$?
+
+            rm -r "$GNUPGHOME"
 
             [[ $exitCode -eq 0 ]] || return $exitCode
         elif [[ -v keyURL && -n "$keyURL" ]]
@@ -275,7 +274,6 @@ function packageManager::installRepository() { # $0 [--key-id <key>] [--key-url 
             [[ $exitCode -eq 0 ]] || return $exitCode
         fi
     fi
-
 
     [[ -v suites ]] || suites="$( . /etc/os-release && echo "$VERSION_CODENAME" )"
     [[ -v components ]] || components='main'
