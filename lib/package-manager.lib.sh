@@ -42,15 +42,32 @@ function packageManager::clean() { # $0 <sudo-message>
 }
 declare -rf packageManager::clean
 
-function packageManager::install() { # $0 <sudo-message> [<package> ...]
-    local    requirePasswordWarningMessage="$1"
-
-    shift
-
+function packageManager::install() { # $0 [--force] <sudo-message> [<package> ...]
     local -i exitCode=0
     local -a packages=()
+    local -a args=()
+    local    argument package
+    local    requirePasswordWarningMessage=
+    local    forceInstall=false
 
     log::addMessage "${FUNCNAME[0]} $*"
+
+    for argument in "$@"
+    do
+        case "$argument" in
+            --force)
+                forceInstall=true
+                ;;
+            *)
+                if [[ -z "$requirePasswordWarningMessage" ]]
+                then
+                    requirePasswordWarningMessage="$argument"
+                else
+                    args+=("$argument")
+                fi
+                ;;
+        esac
+    done
 
     if [[ $# -eq 0 ]]
     then
@@ -59,9 +76,9 @@ function packageManager::install() { # $0 <sudo-message> [<package> ...]
         return 2
     fi
 
-    for package in "$@"
+    for package in "${args[@]}"
     do
-        if packageManager::isInstalled "$package"
+        if ! $forceInstall && packageManager::isInstalled "$package"
         then
             log::addMessage "deselect package '$package' for installation as it's already installed"
             continue
