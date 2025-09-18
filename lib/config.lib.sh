@@ -59,7 +59,7 @@ function config::shell::saveDefault() { # $0 <value>
     then
         printf 'declare defaultShell="%s"\n' "$value" >> "$configFile"
     else
-        sed -E -i 's,declare defaultShell=.*$,declare defaultShell="'"$value"',' "$configFile" || return 0
+        sed -E -i 's,declare defaultShell=.*$,declare defaultShell="'"$value"'",' "$configFile" || return 0
     fi
 
     return 0

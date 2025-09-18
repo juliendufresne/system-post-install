@@ -51,7 +51,6 @@ function fish::changeDefaultShell() {
         if ! dialog::confirm 'Fish shell configuration' 'Do you want to make fish your default shell?' true
         then
             set "-$bashOptions"
-            config::shell::saveDefault 'false'
             output::cleanPreviousLines 1
             output::listItemWarning 'fish is not used as default shell' "$LIST_ITEM_INDENT"
             log::addMessage 'user choose to not use fish as default shell'
@@ -59,7 +58,7 @@ function fish::changeDefaultShell() {
             return 0
         else
             set "-$bashOptions"
-            config::shell::saveDefault 'true'
+            config::shell::saveDefault "fish"
             log::addMessage 'user choose to use fish as default shell'
         fi
     fi
