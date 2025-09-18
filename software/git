@@ -22,7 +22,7 @@ function git::main() {
         git \
         https://ppa.launchpadcontent.net/git-core/ppa/ubuntu \
         |& tee "$output" && \
-    packageManager::install \
+    packageManager::install --force \
         'install git' git |& tee -a "$output" || exitCode=$?
 
     scrollingRegion::restore
