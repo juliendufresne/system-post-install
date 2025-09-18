@@ -88,9 +88,9 @@ function fish::installPackage() {
     exitCode=0
 
     packageManager::installRepository \
-        --key-id 88421E703EDC7AF54967DED473C9FCC9E2BB48DA \
+        --key-url "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x88421e703edc7af54967ded473c9fcc9e2bb48da" \
         fish \
-        https://ppa.launchpadcontent.net/fish-shell/release-3/ubuntu \
+        https://ppa.launchpadcontent.net/fish-shell/release-4/ubuntu \
         |& tee "$output" && \
     packageManager::install \
         'install fish' fish |& tee -a "$output" || exitCode=$?
